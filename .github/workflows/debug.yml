@@ -17,20 +17,40 @@ jobs:
         run: bash seed/make-seed.sh
       - name: install.sh
         run: sudo bash submissions/c-iouring-jowinjestine/install.sh
-      - name: build (PGO, bounded)
+      - name: build (PGO, watched)
         run: |
           cd submissions/c-iouring-jowinjestine
-          timeout 900 bash -x build.sh > /tmp/build.log 2>&1 || echo "build rc=$?"
-          tail -60 /tmp/build.log
-      - name: start and test (bounded)
+          cat > /tmp/dump.sh <<'DUMP'
+          echo "--- processes"; ps -eo pid,ppid,stat,pcpu,etime,comm,args | grep -E 'server|train' | grep -v grep
+          echo "--- listeners (Recv-Q = unaccepted connections)"; ss -ltnp
+          echo "--- sockets (Recv-Q = unread bytes)"; ss -tanpi | grep -v '^LISTEN' | head -150
+          for p in $(pgrep -f 'bin/server' ; pgrep -x train); do
+            echo "--- pid $p $(cat /proc/$p/comm) wchan=$(cat /proc/$p/wchan 2>/dev/null)"
+            for t in /proc/$p/task/*; do echo "  task $(basename $t) $(cat $t/comm) wchan=$(cat $t/wchan 2>/dev/null) stat=$(awk '{print $3}' $t/stat)"; sudo cat $t/stack 2>/dev/null | sed 's/^/    /'; done
+          done
+          DUMP
+          (bash -x build.sh > /tmp/build.log 2>&1; echo "build rc=$?" >> /tmp/build.log) &
+          BPID=$!
+          T=0
+          for i in $(seq 600); do
+            kill -0 $BPID 2>/dev/null || break
+            if pgrep -x train >/dev/null; then T=$((T+1)); else T=0; fi
+            if [ $T -ge 45 ]; then
+              echo "=== training has run for 45 s: dumping state"
+              bash /tmp/dump.sh
+              pkill -KILL -x train || true
+              T=0
+            fi
+            sleep 1
+          done
+          wait $BPID || true
+          echo "=== build log tail"; tail -40 /tmp/build.log
+      - name: start and test (watched)
         run: |
           export JWT_SECRET=twelve-dollar-challenge HOST=127.0.0.1 PORT=3000 SQLITE_PATH=/tmp/feed.db
           cp seed/feed.db /tmp/feed.db
           bash submissions/c-iouring-jowinjestine/start.sh > /tmp/server.log 2>&1 &
-          PID=$!
           for i in $(seq 60); do curl -sf -m 2 http://127.0.0.1:3000/health && break; sleep 1; done; echo
-          timeout 180 bash test/test.sh http://127.0.0.1:3000 || echo "test rc=$?"
+          timeout 180 bash test/test.sh http://127.0.0.1:3000 || { echo "test rc=$?"; bash /tmp/dump.sh; }
           echo "--- server log"; cat /tmp/server.log
-          echo "--- threads"; for t in /proc/$PID/task/*; do echo "$t: $(cat $t/comm) wchan=$(cat $t/wchan 2>/dev/null)"; sudo cat $t/stack 2>/dev/null; done
-          echo "--- sockets"; ss -tanp | head -30
-          kill -TERM $PID; sleep 2; tail -5 /tmp/server.log
+          pkill -TERM -f 'bin/server' || true; sleep 2; tail -5 /tmp/server.log
