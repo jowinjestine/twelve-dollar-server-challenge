@@ -4,53 +4,55 @@ permissions:
   contents: read
 jobs:
   debug:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - name: environment
         run: |
-          uname -a; nproc; free -m; ulimit -a; cat /proc/sys/net/core/somaxconn; cat /sys/kernel/mm/transparent_hugepage/enabled
+          uname -a; nproc; free -m; ulimit -n; gcc --version | head -1
+          cat > /tmp/dump.sh <<'DUMP'
+          echo "--- processes"; ps -eo pid,ppid,stat,pcpu,etime,comm,args | grep -E 'server|train|test.sh|curl' | grep -v grep
+          echo "--- listeners (Recv-Q = unaccepted connections)"; ss -ltnp
+          echo "--- sockets (Recv-Q = unread bytes)"; ss -tanpi | grep -v '^LISTEN' | head -200
+          for p in $(pgrep -f 'bin/server' ; pgrep -x train); do
+            echo "--- pid $p $(cat /proc/$p/comm) wchan=$(cat /proc/$p/wchan 2>/dev/null)"
+            for t in /proc/$p/task/*; do echo "  task $(basename $t) $(cat $t/comm) wchan=$(cat $t/wchan 2>/dev/null) stat=$(awk '{print $3}' $t/stat)"; sudo cat $t/stack 2>/dev/null | sed 's/^/    /'; done
+          done
+          DUMP
+          if [ "${{ matrix.os }}" = ubuntu-22.04 ]; then
+            mkdir -p /tmp/inc/linux
+            curl -fsSL -o /tmp/inc/linux/io_uring.h https://raw.githubusercontent.com/torvalds/linux/v6.8/include/uapi/linux/io_uring.h
+            echo "CC=gcc -I/tmp/inc" >> "$GITHUB_ENV"
+          fi
       - name: tools
         run: sudo apt-get update -qq && sudo apt-get install -y -qq sqlite3 jq curl openssl
       - name: seed
         run: bash seed/make-seed.sh
       - name: install.sh
         run: sudo bash submissions/c-iouring-jowinjestine/install.sh
-      - name: build (PGO, watched)
+      - name: upstream procedure (test/run.sh, watched)
         run: |
-          cd submissions/c-iouring-jowinjestine
-          cat > /tmp/dump.sh <<'DUMP'
-          echo "--- processes"; ps -eo pid,ppid,stat,pcpu,etime,comm,args | grep -E 'server|train' | grep -v grep
-          echo "--- listeners (Recv-Q = unaccepted connections)"; ss -ltnp
-          echo "--- sockets (Recv-Q = unread bytes)"; ss -tanpi | grep -v '^LISTEN' | head -150
-          for p in $(pgrep -f 'bin/server' ; pgrep -x train); do
-            echo "--- pid $p $(cat /proc/$p/comm) wchan=$(cat /proc/$p/wchan 2>/dev/null)"
-            for t in /proc/$p/task/*; do echo "  task $(basename $t) $(cat $t/comm) wchan=$(cat $t/wchan 2>/dev/null) stat=$(awk '{print $3}' $t/stat)"; sudo cat $t/stack 2>/dev/null | sed 's/^/    /'; done
-          done
-          DUMP
-          (bash -x build.sh > /tmp/build.log 2>&1; echo "build rc=$?" >> /tmp/build.log) &
-          BPID=$!
+          (bash test/run.sh submissions/c-iouring-jowinjestine > /tmp/run.log 2>&1; echo "run rc=$?" >> /tmp/run.log) &
+          RPID=$!
           T=0
-          for i in $(seq 600); do
-            kill -0 $BPID 2>/dev/null || break
+          for i in $(seq 900); do
+            kill -0 $RPID 2>/dev/null || break
             if pgrep -x train >/dev/null; then T=$((T+1)); else T=0; fi
             if [ $T -ge 45 ]; then
-              echo "=== training has run for 45 s: dumping state"
-              bash /tmp/dump.sh
-              pkill -KILL -x train || true
-              T=0
+              echo "=== training client has run for 45 s: dumping state"; bash /tmp/dump.sh
+              pkill -KILL -x train || true; T=0
+            fi
+            if [ $i -ge 600 ]; then
+              echo "=== run.sh still running after 600 s: dumping state"; bash /tmp/dump.sh
+              echo "--- run.log tail"; tail -30 /tmp/run.log
+              pkill -KILL -f 'bin/server' || true; pkill -KILL -x train || true; break
             fi
             sleep 1
           done
-          wait $BPID || true
-          echo "=== build log tail"; tail -40 /tmp/build.log
-      - name: start and test (watched)
-        run: |
-          export JWT_SECRET=twelve-dollar-challenge HOST=127.0.0.1 PORT=3000 SQLITE_PATH=/tmp/feed.db
-          cp seed/feed.db /tmp/feed.db
-          bash submissions/c-iouring-jowinjestine/start.sh > /tmp/server.log 2>&1 &
-          for i in $(seq 60); do curl -sf -m 2 http://127.0.0.1:3000/health && break; sleep 1; done; echo
-          timeout 180 bash test/test.sh http://127.0.0.1:3000 || { echo "test rc=$?"; bash /tmp/dump.sh; }
-          echo "--- server log"; cat /tmp/server.log
-          pkill -TERM -f 'bin/server' || true; sleep 2; tail -5 /tmp/server.log
+          wait $RPID || true
+          echo "=== run.log"; grep -v '^\s*$' /tmp/run.log | tail -60
