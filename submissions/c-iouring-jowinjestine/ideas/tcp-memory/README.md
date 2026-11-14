@@ -1,6 +1,13 @@
 # Idea: keep the kernel out of TCP memory pressure at the end of the ramp
 
-Status: **not built, not tested.** This is a parked idea with the evidence behind it and a plan to test it.
+Status: **refuted by measurement (2026-11-14), not built.**
+
+Sampling `/proc/net/sockstat` every 0.25 s in the guest during a 310k run showed that the kernel's TCP memory stays
+tiny for the whole measured run: about 52 MB at most, at the end of the ramp, against the ~116 MB pressure line. The
+pressure episode below (up to 926 MB and ~238,000 prunes in about 3 s) happens when the load generator exits and
+closes all 310,000 connections at once, after the measurement ends. It never touches the score, so pacing answers
+to stay under the line would change nothing. The real stall in that run came mid-ramp (t = 40-50 s, p99 1.9 s in
+that window), with no TCP memory involved. The original write-up follows for the record.
 
 ## What we saw
 
