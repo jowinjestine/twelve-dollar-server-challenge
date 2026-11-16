@@ -20,19 +20,19 @@ jobs:
           cells=$(jq -c '.defaults as $d | [.variants[] | . as $v | ($v.users // $d.users)[] as $u | ($v.reps // $d.reps)[] as $r
             | {name: $v.name, sha: $v.sha, dir: $v.dir, env: ($v.env // ""), users: $u, rep: $r,
                ramp: ($v.ramp // $d.ramp), hold: ($v.hold // $d.hold), down: ($v.down // $d.down),
-               mem: ($v.mem // $d.mem), cpumax: ($v.cpumax // $d.cpumax)}]' farm/matrix.json)
+               mem: ($v.mem // $d.mem), cpumax: ($v.cpumax // $d.cpumax), burn: ($v.burn // $d.burn // ""), os: ($v.os // $d.os // "ubuntu-24.04")}]' farm/matrix.json)
           echo "cells=$cells" >> "$GITHUB_OUTPUT"
           echo "$cells" | jq -r '.[] | "\(.name) \(.users) rep\(.rep)"'
 
   run:
     needs: plan
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.cell.os }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         cell: ${{ fromJson(needs.plan.outputs.cells) }}
-    name: ${{ matrix.cell.name }} ${{ matrix.cell.users }} r${{ matrix.cell.rep }}
+    name: ${{ matrix.cell.name }} ${{ matrix.cell.users }} r${{ matrix.cell.rep }} ${{ matrix.cell.os }}
     steps:
       - uses: actions/checkout@v4
       - name: entry source
@@ -56,17 +56,18 @@ jobs:
           NAME: ${{ matrix.cell.name }}
           MEM: ${{ matrix.cell.mem }}
           CPUMAX: ${{ matrix.cell.cpumax }}
+          BURN: ${{ matrix.cell.burn }}
           VENV: ${{ matrix.cell.env }}
         run: |
-          sudo --preserve-env=NAME,MEM,CPUMAX,VENV OUT=$PWD/out RUNUSER=$(id -un) bash farm/run.sh "$PWD/repo" ${{ matrix.cell.dir }} \
+          sudo --preserve-env=NAME,MEM,CPUMAX,BURN,VENV OUT=$PWD/out RUNUSER=$(id -un) bash farm/run.sh "$PWD/repo" ${{ matrix.cell.dir }} \
             ${{ matrix.cell.users }} ${{ matrix.cell.ramp }} ${{ matrix.cell.hold }} ${{ matrix.cell.down }}
           sudo chown -R $(id -u) out
           echo "rep ${{ matrix.cell.rep }} env[${{ matrix.cell.env }}] $(cat out/result.txt)" >> "$GITHUB_STEP_SUMMARY"
-          echo "rep=${{ matrix.cell.rep }} sha=${{ matrix.cell.sha }} env=[${{ matrix.cell.env }}]" >> out/result.txt
+          echo "rep=${{ matrix.cell.rep }} os=${{ matrix.cell.os }} cpumax=[${{ matrix.cell.cpumax }}] burn=[${{ matrix.cell.burn }}] sha=${{ matrix.cell.sha }} env=[${{ matrix.cell.env }}]" >> out/result.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: farm-${{ matrix.cell.name }}-${{ matrix.cell.users }}-r${{ matrix.cell.rep }}
+          name: farm-${{ matrix.cell.name }}-${{ matrix.cell.users }}-r${{ matrix.cell.rep }}-${{ strategy.job-index }}
           path: |
             out/
             build.log
