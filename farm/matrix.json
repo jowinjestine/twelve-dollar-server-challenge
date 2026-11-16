@@ -20,14 +20,20 @@
  },
  "models": [
   {
-   "name": "cpu50",
-   "cpumax": "5000 10000",
-   "burn": ""
+   "name": "burn0",
+   "cpumax": "max",
+   "burn": "0",
+   "reps": [
+    1,
+    2,
+    3,
+    4
+   ]
   },
   {
-   "name": "cpu65",
-   "cpumax": "6500 10000",
-   "burn": "",
+   "name": "burnm5",
+   "cpumax": "max",
+   "burn": "-5",
    "reps": [
     1,
     2,
