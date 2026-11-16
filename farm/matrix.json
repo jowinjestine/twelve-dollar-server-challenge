@@ -1,138 +1,59 @@
 {
- "comment": "One job per variant x users x rep. sha: any commit reachable in the upstream repo or the fork (full 40-char SHA). dir: folder under submissions/. env: extra server env (K=V ...). Optional per-variant users/reps override the defaults.",
+ "comment": "Each job = one model x users x rep on its own runner, and runs EVERY variant back to back (order rotated by rep) so variants are compared on the same hardware. sha: full SHA reachable in upstream or the fork. dir: folder under submissions/. env: extra server env (K=V ...).",
  "defaults": {
   "users": [
-   280000,
    300000
   ],
   "reps": [
    1,
    2,
-   3
+   3,
+   4,
+   5,
+   6
   ],
   "ramp": 60,
   "hold": 120,
   "down": 30,
   "mem": "1800M",
-  "cpumax": "max",
-  "burn": "",
-  "os": "ubuntu-24.04"
+  "os": "ubuntu-22.04"
  },
+ "models": [
+  {
+   "name": "cpu50",
+   "cpumax": "5000 10000",
+   "burn": ""
+  },
+  {
+   "name": "cpu65",
+   "cpumax": "6500 10000",
+   "burn": "",
+   "reps": [
+    1,
+    2,
+    3,
+    4
+   ]
+  }
+ ],
  "variants": [
   {
-   "name": "kensac-cpu50",
+   "name": "kensac",
    "sha": "14601c8e17c88a0ef7e7ef194599cd1e4fa42f63",
    "dir": "rust-iouring-kensac",
-   "env": "",
-   "cpumax": "5000 10000",
-   "users": [
-    300000
-   ],
-   "reps": [
-    1,
-    2,
-    3
-   ]
+   "env": ""
   },
   {
-   "name": "ours-8193037-cpu50",
+   "name": "ours-8193037",
    "sha": "81930371c3d01132cfc27d7c1df16d5e39f9f850",
    "dir": "c-iouring-jowinjestine",
-   "env": "",
-   "cpumax": "5000 10000",
-   "users": [
-    300000
-   ],
-   "reps": [
-    1,
-    2,
-    3
-   ]
+   "env": ""
   },
   {
-   "name": "ours-91da0e6-cpu50",
+   "name": "ours-91da0e6",
    "sha": "91da0e6a1d9c97f3ab28166ea4a02286a57e4888",
    "dir": "c-iouring-jowinjestine",
-   "env": "",
-   "cpumax": "5000 10000",
-   "users": [
-    300000
-   ],
-   "reps": [
-    1,
-    2,
-    3
-   ]
-  },
-  {
-   "name": "kensac-burn0",
-   "sha": "14601c8e17c88a0ef7e7ef194599cd1e4fa42f63",
-   "dir": "rust-iouring-kensac",
-   "env": "",
-   "burn": "0",
-   "users": [
-    300000
-   ],
-   "reps": [
-    1,
-    2
-   ]
-  },
-  {
-   "name": "ours-8193037-burn0",
-   "sha": "81930371c3d01132cfc27d7c1df16d5e39f9f850",
-   "dir": "c-iouring-jowinjestine",
-   "env": "",
-   "burn": "0",
-   "users": [
-    300000
-   ],
-   "reps": [
-    1,
-    2
-   ]
-  },
-  {
-   "name": "ours-91da0e6-burn0",
-   "sha": "91da0e6a1d9c97f3ab28166ea4a02286a57e4888",
-   "dir": "c-iouring-jowinjestine",
-   "env": "",
-   "burn": "0",
-   "users": [
-    300000
-   ],
-   "reps": [
-    1,
-    2
-   ]
-  },
-  {
-   "name": "kensac-u2204",
-   "sha": "14601c8e17c88a0ef7e7ef194599cd1e4fa42f63",
-   "dir": "rust-iouring-kensac",
-   "env": "",
-   "cpumax": "5000 10000",
-   "os": "ubuntu-22.04",
-   "users": [
-    300000
-   ],
-   "reps": [
-    1
-   ]
-  },
-  {
-   "name": "ours-8193037-u2204",
-   "sha": "81930371c3d01132cfc27d7c1df16d5e39f9f850",
-   "dir": "c-iouring-jowinjestine",
-   "env": "",
-   "cpumax": "5000 10000",
-   "os": "ubuntu-22.04",
-   "users": [
-    300000
-   ],
-   "reps": [
-    1
-   ]
+   "env": ""
   }
  ]
 }

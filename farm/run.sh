@@ -41,7 +41,7 @@ rmdir $G 2>/dev/null; mkdir -p $G
 for c in cpu memory; do grep -qw $c /sys/fs/cgroup/cgroup.subtree_control || echo +$c > /sys/fs/cgroup/cgroup.subtree_control; done
 echo "$MEM" > $G/memory.max; echo 0 > $G/memory.swap.max 2>/dev/null; echo "$CPUMAX" > $G/cpu.max 2>/dev/null
 D=$(mktemp -d /var/tmp/farmdb.XXXX); chown $RUNUSER $D
-( echo $BASHPID > $G/cgroup.procs; exec setpriv --reuid=$RUNUSER --regid=$RUNUSER --init-groups cp "$R/seed/feed.db" $D/feed.db )
+( echo $BASHPID > $G/cgroup.procs; exec setpriv --reuid=$RUNUSER --regid=$RUNUSER --init-groups cp "${SEEDDIR:-$R/seed}/feed.db" $D/feed.db )
 sync # written back, still cached (charged to the cgroup), as after the rig's copy
 echo "   db $(du -m $D/feed.db | cut -f1) MB on $(df $D | tail -1 | awk '{print $1}'), cgroup memory after copy $(( $(cat $G/memory.current) >> 20 )) MB"
 
@@ -63,7 +63,7 @@ if [ -n "${BURN:-}" ]; then ( exec taskset -c 0 nice -n $BURN sh -c 'while :; do
 ( while sleep 10; do awk '/^oom_kill /{print $2}' $G/memory.events > $OUT/oom.last; echo $(( $(cat $G/memory.peak) >> 20 )) > $OUT/peak.last; echo "   [mon] cg_mem=$(( $(cat $G/memory.current) >> 20 ))MB $(grep -E '^(anon|file|sock|slab) ' $G/memory.stat | awk '{printf "%s=%dMB ", $1, $2/1048576}') free=$(awk '/MemFree/{print int($2/1024)}' /proc/meminfo)MB tcp:$(grep '^TCP:' /proc/net/sockstat | cut -d' ' -f2-) $(ip netns exec srv cat /proc/net/sockstat | grep '^TCP:' | cut -d' ' -f2-3)"; done ) & MON=$!
 
 ulimit -n 1048576
-SRC_BASE=10.9.1.2 CONNS_PER_IP=25000 TOKENS="$R/seed/tokens.json" taskset -c 1-3 /tmp/loadc 10.9.0.100 3000 $N $RAMP $HOLD 6 $DOWN 10 > $OUT/loadc.txt
+SRC_BASE=10.9.1.2 CONNS_PER_IP=25000 TOKENS="${SEEDDIR:-$R/seed}/tokens.json" taskset -c 1-3 /tmp/loadc 10.9.0.100 3000 $N $RAMP $HOLD 6 $DOWN 10 > $OUT/loadc.txt
 kill $MON 2>/dev/null; [ -n "${BURNER:-}" ] && kill $BURNER 2>/dev/null
 cat $OUT/loadc.txt
 U1=$(awk '/usage_usec/{print $2}' $G/cpu.stat); T1=$(date +%s%N)

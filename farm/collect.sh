@@ -7,8 +7,9 @@ RUN=${1:-$(gh run list -R "$REPO" -w farm -b bench-farm -L 1 --json databaseId -
 gh run view "$RUN" -R "$REPO" --json status,conclusion,createdAt -q '"run '"$RUN"': \(.status) \(.conclusion) \(.createdAt)"'
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 gh run download "$RUN" -R "$REPO" -D "$T" -p 'farm-*' >/dev/null 2>&1 || true
-for f in "$T"/farm-*/out/result.txt; do
-  [ -f "$f" ] || continue
-  rep=$(grep -o 'rep=[0-9]*' "$f" | head -1); env=$(grep -o 'env=\[[^]]*\]' "$f" | head -1)
-  echo "$(grep '^RESULT' "$f" | sed 's/^RESULT //') $rep $env"
-done | sort -k1,1 -k2,2V | column -t || true
+# one line per variant run: name users verdict ... order= model= rep= env=
+cat "$T"/farm-*/result-*.txt 2>/dev/null | sed 's/^RESULT //' | sort -k1,1 | column -t || true
+echo "== paired (same runner): whole-run p99 ms per job, variants side by side"
+for d in "$T"/farm-*/; do
+  echo "$(basename "$d") $(cat "$d"result-*.txt 2>/dev/null | sed 's/^RESULT //' | awk '{for(i=1;i<=NF;i++){if($i~/^whole_p99=/)p=$i; if($i~/^cpumodel=/)c=$i}; printf "%s:%s:%s ", $1, $3, substr(p,11)} END {print c}')"
+done | sort

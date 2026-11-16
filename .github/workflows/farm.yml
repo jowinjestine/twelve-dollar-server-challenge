@@ -1,4 +1,5 @@
-# Load-test farm: every variant x users x rep in farm/matrix.json on its own runner (see farm/run.sh).
+# Load-test farm. Each job (model x users x rep from farm/matrix.json) runs on its own runner and runs
+# every variant back to back there (farm/job.sh -> farm/run.sh), so variants are compared on the same hardware.
 name: farm
 on:
   push:
@@ -17,58 +18,30 @@ jobs:
       - uses: actions/checkout@v4
       - id: p
         run: |
-          cells=$(jq -c '.defaults as $d | [.variants[] | . as $v | ($v.users // $d.users)[] as $u | ($v.reps // $d.reps)[] as $r
-            | {name: $v.name, sha: $v.sha, dir: $v.dir, env: ($v.env // ""), users: $u, rep: $r,
-               ramp: ($v.ramp // $d.ramp), hold: ($v.hold // $d.hold), down: ($v.down // $d.down),
-               mem: ($v.mem // $d.mem), cpumax: ($v.cpumax // $d.cpumax), burn: ($v.burn // $d.burn // ""), os: ($v.os // $d.os // "ubuntu-24.04")}]' farm/matrix.json)
+          cells=$(jq -c '.defaults as $d | [.models[] | . as $m | ($m.users // $d.users)[] as $u | ($m.reps // $d.reps)[] as $r
+            | {model: $m.name, cpumax: ($m.cpumax // "max"), burn: ($m.burn // ""), mem: ($m.mem // $d.mem), os: ($m.os // $d.os),
+               users: $u, rep: $r, ramp: $d.ramp, hold: $d.hold, down: $d.down}]' farm/matrix.json)
           echo "cells=$cells" >> "$GITHUB_OUTPUT"
-          echo "$cells" | jq -r '.[] | "\(.name) \(.users) rep\(.rep)"'
+          echo "$cells" | jq -r '.[] | "\(.model) \(.users) rep\(.rep) \(.os)"'
 
   run:
     needs: plan
     runs-on: ${{ matrix.cell.os }}
-    timeout-minutes: 45
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
         cell: ${{ fromJson(needs.plan.outputs.cells) }}
-    name: ${{ matrix.cell.name }} ${{ matrix.cell.users }} r${{ matrix.cell.rep }} ${{ matrix.cell.os }}
+    name: ${{ matrix.cell.model }} ${{ matrix.cell.users }} r${{ matrix.cell.rep }}
     steps:
       - uses: actions/checkout@v4
-      - name: entry source
-        run: |
-          git init -q repo && cd repo
-          git remote add up https://github.com/arjaythedev/twelve-dollar-server-challenge
-          git remote add fork https://github.com/${{ github.repository }}
-          git fetch -q --depth 1 up ${{ matrix.cell.sha }} || git fetch -q --depth 1 fork ${{ matrix.cell.sha }}
-          git checkout -q FETCH_HEAD && git log --oneline -1
-      - name: seed
-        run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq sqlite3 jq >/dev/null
-          bash repo/seed/make-seed.sh
-      - name: install + build
-        run: |
-          sudo bash repo/submissions/${{ matrix.cell.dir }}/install.sh > install.log 2>&1 || { tail -40 install.log; exit 1; }
-          bash repo/submissions/${{ matrix.cell.dir }}/build.sh > build.log 2>&1 || { tail -60 build.log; exit 1; }
-          tail -3 build.log
-      - name: load
-        env:
-          NAME: ${{ matrix.cell.name }}
-          MEM: ${{ matrix.cell.mem }}
-          CPUMAX: ${{ matrix.cell.cpumax }}
-          BURN: ${{ matrix.cell.burn }}
-          VENV: ${{ matrix.cell.env }}
-        run: |
-          sudo --preserve-env=NAME,MEM,CPUMAX,BURN,VENV OUT=$PWD/out RUNUSER=$(id -un) bash farm/run.sh "$PWD/repo" ${{ matrix.cell.dir }} \
-            ${{ matrix.cell.users }} ${{ matrix.cell.ramp }} ${{ matrix.cell.hold }} ${{ matrix.cell.down }}
-          sudo chown -R $(id -u) out
-          echo "rep ${{ matrix.cell.rep }} env[${{ matrix.cell.env }}] $(cat out/result.txt)" >> "$GITHUB_STEP_SUMMARY"
-          echo "rep=${{ matrix.cell.rep }} os=${{ matrix.cell.os }} cpumax=[${{ matrix.cell.cpumax }}] burn=[${{ matrix.cell.burn }}] sha=${{ matrix.cell.sha }} env=[${{ matrix.cell.env }}]" >> out/result.txt
+      - name: tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq sqlite3 jq >/dev/null
+      - name: build and run every variant
+        run: bash farm/job.sh '${{ toJson(matrix.cell) }}'
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: farm-${{ matrix.cell.name }}-${{ matrix.cell.users }}-r${{ matrix.cell.rep }}-${{ strategy.job-index }}
-          path: |
-            out/
-            build.log
+          name: farm-${{ matrix.cell.model }}-${{ matrix.cell.users }}-r${{ matrix.cell.rep }}
+          path: out/
           retention-days: 14
