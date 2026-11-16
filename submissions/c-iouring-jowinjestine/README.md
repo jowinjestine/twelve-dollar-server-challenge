@@ -284,3 +284,110 @@ Other local runs: 5,000 users over three rings of 1,936 slots (ring switching), 
 process memory; receive buffers starved to 16 per ring, 0 errors (the read queue absorbs it).
 Loopback charges the client side's receive work to the server too, so these are only comparable
 with each other.
+
+---
+
+## Experimental 400K capacity options (fork branch only)
+
+This branch is a **performance experiment**, not a demonstrated 400,000-user result.
+It retains the original #441 application/database semantics and exposes two
+independent network scheduling switches:
+
+- `IDLE_POLL=1` (experimental default): arm `IORING_OP_POLL_ADD` with
+  `IORING_POLL_ADD_MULTI` for idle connection readiness and use bounded
+  `MSG_DONTWAIT` one-shot `IORING_OP_RECV` calls after a poll event.
+  Poll requests are canceled by user-data before shutdown/close.
+  `IDLE_POLL=0` restores #441's original multishot receives.
+- `BACKLOG_SLICE_US=75000` (experimental default): impose a soft 75-ms
+  budget on processing an existing backlog of more than 1024 ready entries.
+  This does **not** cap total event-loop latency or interrupt DB commits.
+  `BACKLOG_SLICE_US=0` restores #441's original uninterrupted ready pass.
+- `PRE_CONNS=430000` (experimental default): attempt to create the rings
+  necessary for 400K connections before the connection ramp. This allocates
+  additional ring resources up front and may itself use too much RAM.
+  The default is `PRE_CONNS=330000` for the 310K+ leaderboard target.
+
+Suggested A/B configurations on an otherwise identical system:
+
+| Variant | IDLE_POLL | BACKLOG_SLICE_US | Purpose |
+|---|---:|---:|---|
+| Control | 0 | 0 | #441 networking/backlog behavior |
+| Poll only | 1 | 0 | Isolate memory and CPU cost of polling |
+| Slice only | 0 | 75000 | Isolate long-turn behavior |
+| Combined | 1 | 75000 | Test whether benefits add |
+
+Set `PRE_CONNS=330000` on all variants if comparing to #441's original
+ring pre-allocation policy. Track `poll_events`, `poll_ends`,
+`poll_rearms`, `max_turn`, `ready_max`, `enobufs`, CPU,
+app RSS, socket slab, and major faults. A result is meaningful only if
+the unchanged application still passes all 42 functional tests and the
+same five-minute load/latency criteria.
+
+These changes are **not validated by a successful build, CI, or load test yet**.
+
+
+### Secondary-ring wakeups and receive-memory controls
+
+- `EVENTFD_WAKE=1` (experimental default) registers an eventfd on each
+  secondary io_uring and polls those eventfds from ring 0. Nonzero rings
+  then omit `IORING_SETUP_DEFER_TASKRUN` so their CQEs can wake ring 0
+  without an extra `io_uring_enter(GETEVENTS)` per ring per batch.
+  `EVENTFD_WAKE=0` retains #441's original per-ring servicing policy.
+  If eventfd registration fails, the server falls back to legacy servicing.
+- `RECV_SIZE=512` (experimental default, 256/512/1024/2048 accepted):
+  smaller provided receive buffers reduce resident memory at the cost of
+  more partial reads for large requests. `RECV_SIZE=1024` restores #441's
+  size. Seven rings of 8192 buffers save about 28 MiB at 512 vs 1024.
+  The buffer size is **not** per-connection socket memory.
+- New `eventfd_events` diagnostic counts cross-ring wake notifications.
+
+**Recommended test sequence:** with `PRE_CONNS=330000`, first compare
+`IDLE_POLL=0 EVENTFD_WAKE=0 RECV_SIZE=1024 BACKLOG_SLICE_US=0`
+(control) to (1) eventfd only, (2) smaller buffers only, (3) idle polling
+only, (4) slicing only, and then the combined defaults. Restore
+`PRE_CONNS=430000` only for the 400K ramp. Do not infer a score from
+an allocation bound or a low-concurrency microbenchmark.
+
+
+---
+
+## Follow-up: software SHA-256 and optional LTO (separate PR)
+
+This experiment follows #479. Its performance hypothesis is **not yet verified**.
+
+- **SHA256_ROLLING16=1 (default)**: compute SHA-256's schedule in 16
+  circular words instead of a 64-word array, reducing stack footprint and
+  potentially benefiting short JWT HMAC messages. The unchanged HMAC key
+  precomputation and signature verification are still required for every
+  authenticated request. **SHA256_ROLLING16=0** restores the previous
+  compression function; both modes run NIST and RFC 4231 test vectors on
+  every build.
+- **LTO=1 (opt-in)**: adds GCC link-time optimization to the existing
+  profile-guided compilation. Keep **LTO=0** for the control build.
+  Most of SQLite and the server already compile as a single C translation
+  unit, so the incremental benefit may be very small. Compare builds
+  using identical PGO training and five-minute test conditions.
+
+Suggested isolated experiments:
+1. `SHA256_ROLLING16=0 LTO=0`: #479 crypto/build control.
+2. `SHA256_ROLLING16=1 LTO=0`: rolling SHA schedule only.
+3. `SHA256_ROLLING16=0 LTO=1`: LTO only.
+4. `SHA256_ROLLING16=1 LTO=1`: combined after validation.
+
+**Not copied from the 400K blueprint:**
+
+- `SQLITE_THREADSAFE=0`: #479 runs multiple checkpoint threads
+  with their own SQLite connections; keep `THREADSAFE=2`.
+- Long-lived read snapshots: #479 already opens a transaction once per
+  batch, and keeps B-tree cursors alive within that transaction. Keeping
+  snapshots across write batches risks WAL retention and stale visibility.
+- SIMD JSON escapes and fast decimal formatting: already implemented
+  in `src/json.h` (AVX2 and two-digit table). Duplicating them adds no value.
+- SHA-NI: Xeon Platinum 8260 is Cascade Lake, which does not normally
+  expose the SHA extensions; do not make hardware SHA mandatory.
+- `SEND_ZC` for short replies: pin/unpin or notification costs can exceed
+  copying the payload. Requires a controlled test before implementation.
+- Sub-1.5-KiB TCP sockets: #479's user-space `struct conn` is already
+  compact; Linux's kernel per-socket slab is substantially larger.
+
+Only the official 1-vCPU/2-GB five-minute benchmark establishes a score.
