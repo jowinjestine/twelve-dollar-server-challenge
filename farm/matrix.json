@@ -2,7 +2,7 @@
  "comment": "Each job = one model x users x rep on its own runner, and runs EVERY variant back to back (order rotated by rep) so variants are compared on the same hardware. sha: full SHA reachable in upstream or the fork. dir: folder under submissions/. env: extra server env (K=V ...).",
  "defaults": {
   "users": [
-   300000
+   320000
   ],
   "reps": [
    1,
@@ -15,25 +15,14 @@
   "ramp": 60,
   "hold": 120,
   "down": 30,
-  "mem": "1800M",
+  "mem": "1850M",
   "os": "ubuntu-22.04"
  },
  "models": [
   {
-   "name": "burn0",
+   "name": "burn0-320k",
    "cpumax": "max",
    "burn": "0",
-   "reps": [
-    1,
-    2,
-    3,
-    4
-   ]
-  },
-  {
-   "name": "burnm5",
-   "cpumax": "max",
-   "burn": "-5",
    "reps": [
     1,
     2,
@@ -44,20 +33,26 @@
  ],
  "variants": [
   {
-   "name": "kensac",
-   "sha": "14601c8e17c88a0ef7e7ef194599cd1e4fa42f63",
-   "dir": "rust-iouring-kensac",
-   "env": ""
-  },
-  {
-   "name": "ours-8193037",
+   "name": "base-8193037",
    "sha": "81930371c3d01132cfc27d7c1df16d5e39f9f850",
    "dir": "c-iouring-jowinjestine",
    "env": ""
   },
   {
-   "name": "ours-91da0e6",
-   "sha": "91da0e6a1d9c97f3ab28166ea4a02286a57e4888",
+   "name": "A-482a49e",
+   "sha": "482a49e544a5914c32c66a1bbd3d60114c222047",
+   "dir": "c-iouring-jowinjestine",
+   "env": ""
+  },
+  {
+   "name": "B-e508cc0",
+   "sha": "e508cc09ae0e627eed5f941068e35fa6880aa5cf",
+   "dir": "c-iouring-jowinjestine",
+   "env": ""
+  },
+  {
+   "name": "C-e487a70",
+   "sha": "e487a70d8b8ecb266643fe2690f6c2220ccd0cac",
    "dir": "c-iouring-jowinjestine",
    "env": ""
   }
