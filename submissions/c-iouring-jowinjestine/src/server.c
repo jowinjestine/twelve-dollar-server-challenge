@@ -19,18 +19,25 @@
 #define NLISTEN 8
 #define ACCEPT_NEXT_MAX 8192 /* make the next ring this many connections before the current one is full */
 #define ACCEPT_STOP_MAX 6144 /* stop accepting on a ring this many slots before its table is full */
-#define RECV_BUF_SIZE 1024 /* a request is ~150-400 bytes; a longer one spans buffers */
+#define RECV_BUF_SIZE_DEFAULT 1024 /* a request is ~150-400 bytes; a longer one spans buffers */
 #define ARENA_CAP (1u << 20)
 #define ARENA_POOL 16 /* arenas kept for reuse (1 MB each); a burst maps more and unmaps them after */
 #define READS_PER_PASS 16384
 #define IDLE_NS 100000000ULL
 /* the batch shape (tunable for experiments: ANSWERS_PER_PASS, WAIT_MIN, WAIT_US) */
-static unsigned answers_per_pass = 16384, wait_min = 256;
+static unsigned answers_per_pass = 2048, wait_min = 256;
+static int poll_idle = 0; /* IDLE_POLL=1: idle sockets wait on a multishot poll instead of a multishot receive */
+static int eventfd_wake = 0; /* EVENTFD_WAKE=1: other rings wake ring 0 through an eventfd (more, smaller batches: more CPU) */
+static unsigned recv_buf_size = RECV_BUF_SIZE_DEFAULT;
+/* Optional soft wall-clock budget for processing a pre-existing ready backlog.
+ * Experimental: 0 disables it. Does not interrupt a SQLite transaction or send. */
+static unsigned backlog_slice_us = 0;
+static uint64_t sliced_ready_passes;
 static uint64_t wait_ns = 1000000ULL;
 #define PEND_MAX (HTTP_MAX_HEAD + HTTP_MAX_BODY)
 #define STATS_NS 10000000000ULL
 
-enum { UD_ACCEPT = 1, UD_RECV, UD_READ, UD_SEND, UD_SHUTDOWN, UD_CLOSE, UD_CANCEL };
+enum { UD_ACCEPT = 1, UD_RECV, UD_READ, UD_SEND, UD_SHUTDOWN, UD_CLOSE, UD_CANCEL, UD_POLL, UD_EVENTFD };
 #define UD(op, ring, gen, slot) (((uint64_t)(op) << 56) | ((uint64_t)(ring) << 48) | ((uint64_t)(gen) << 32) | (uint64_t)(slot))
 #define UD_OP(u) ((unsigned)((u) >> 56))
 #define UD_RING(u) ((unsigned)((u) >> 48) & 0xff)
@@ -49,7 +56,9 @@ enum {
   CF_READY = 64,       /* bytes read but not yet answered (on the ready list) */
   CF_RQ = 128,         /* on the read queue */
   CF_RECVING = 256,    /* a single-shot read in flight */
-  CF_MULTI = 512       /* the multishot receive is armed */
+  CF_MULTI = 512,      /* the multishot receive is armed */
+  CF_POLL = 1024,      /* a multishot POLL_ADD is armed */
+  CF_POLL_REARM = 2048 /* a poll ended: rearm after this batch */
 };
 
 struct arena {
@@ -74,6 +83,7 @@ struct rs {
   unsigned open;
   uint8_t accept_armed; /* one bit per listener */
   uint8_t created;
+  int efd; /* eventfd for reporting this ring's CQEs to ring 0; -1 if unused */
 };
 
 struct reply {
@@ -98,12 +108,14 @@ static struct arena *batch_arenas[512];
 static unsigned n_batch_arenas;
 static struct reply *replies;
 static unsigned nrep, rep_cap;
-static uint64_t *ready, *held, *rq;
+static uint64_t *ready, *held, *rq, *poll_rearms;
+static unsigned n_poll_rearms, poll_rearms_cap;
 static unsigned nready, ready_cap, nheld, held_cap, nrq, rq_head, rq_cap;
 static unsigned answers_left;
 
 static struct {
   uint64_t batches, cqes, reqs, accepts, closes, enobufs, reads, deferred, rq_max, ready_max, max_batch, cq_overflow, cancels;
+  uint64_t poll_events, poll_ends, poll_rearmed, eventfd_events;
   uint64_t max_turn_ns, max_commit_ns, max_gap_ns; /* longest batch, longest commit, longest time outside a batch while busy */
 } S;
 static uint64_t reads_done; /* single-shot reads that returned data or EAGAIN */
@@ -199,7 +211,12 @@ static inline int ref_live(uint64_t ref, struct conn *c) {
 static void conn_close(unsigned ri, uint32_t slot, struct conn *c) {
   if ((c->flags & (CF_OPEN | CF_CLOSING)) != CF_OPEN) return;
   c->flags |= CF_CLOSING;
-  sqe_shutdown_close(&R[ri].r, slot, UD(UD_SHUTDOWN, ri, c->gen, slot), UD(UD_CLOSE, ri, c->gen, slot));
+  if (poll_idle)
+    sqe_shutdown_close_poll(&R[ri].r, slot, UD(UD_POLL, ri, c->gen, slot),
+                            UD(UD_CANCEL, ri, c->gen, slot), UD(UD_SHUTDOWN, ri, c->gen, slot),
+                            UD(UD_CLOSE, ri, c->gen, slot));
+  else
+    sqe_shutdown_close(&R[ri].r, slot, UD(UD_SHUTDOWN, ri, c->gen, slot), UD(UD_CLOSE, ri, c->gen, slot));
   S.closes++;
 }
 
@@ -219,6 +236,15 @@ static void conn_freed(unsigned ri, struct conn *c) {
 static inline void arm_multishot(unsigned ri, uint32_t slot, struct conn *c) {
   sqe_recv_multishot(ring_sqe(&R[ri].r), slot, UD(UD_RECV, ri, c->gen, slot));
   c->flags |= CF_MULTI;
+}
+
+/* Mode-selecting idle registration.  POLL_ADD stays armed while a nonblocking
+ * one-shot recv drains the input, so idle sockets avoid an armed recv request. */
+static inline void arm_idle(unsigned ri, uint32_t slot, struct conn *c) {
+  if (!poll_idle) { arm_multishot(ri, slot, c); return; }
+  if (c->flags & (CF_POLL | CF_POLL_REARM)) return;
+  sqe_poll_multishot_conn(ring_sqe(&R[ri].r), slot, UD(UD_POLL, ri, c->gen, slot));
+  c->flags |= CF_POLL;
 }
 
 static inline void queue_read(unsigned ri, uint32_t slot, struct conn *c) {
@@ -334,7 +360,8 @@ static void finish_conn(unsigned ri, uint32_t slot, struct conn *c) {
 static int ring_create(unsigned i) {
   const char *err = "";
   unsigned cq = 65536;
-  while (ring_init(&R[i].r, 4096, cq, ring_slots, recv_bufs, RECV_BUF_SIZE, &err) < 0) {
+  while (ring_init(&R[i].r, 4096, cq, ring_slots, recv_bufs, recv_buf_size,
+                   i == 0 || !eventfd_wake, &err) < 0) {
     if (errno != ENOMEM || strcmp(err, "io_uring_setup") || cq <= 8192) {
       fprintf(stderr, "ring %u: %s: %s\n", i, err, strerror(errno));
       return -1;
@@ -344,7 +371,20 @@ static int ring_create(unsigned i) {
   R[i].conns = calloc(ring_slots, sizeof(struct conn));
   if (!R[i].conns) { perror("calloc conns"); return -1; }
   prefault(R[i].conns, (size_t)ring_slots * sizeof(struct conn));
-  prefault(R[i].r.bufs, (size_t)recv_bufs * RECV_BUF_SIZE);
+  prefault(R[i].r.bufs, (size_t)recv_bufs * recv_buf_size);
+  R[i].efd = -1;
+  if (i > 0 && eventfd_wake) {
+    R[i].efd = ring_register_eventfd(&R[i].r);
+    if (R[i].efd < 0) {
+      /* All earlier rings are still correct with the legacy enter-each-ring
+       * policy. Later rings will be initialized with DEFER_TASKRUN. */
+      fprintf(stderr, "ring %u: eventfd registration failed (%s); reverting to legacy ring servicing\n",
+              i, strerror(errno));
+      eventfd_wake = 0;
+    } else {
+      sqe_poll_eventfd(ring_sqe(&R[0].r), R[i].efd, UD(UD_EVENTFD, i, 0, 0));
+    }
+  }
   R[i].created = 1;
   fprintf(stderr, "ring %u: io_uring fd %d, %u CQ entries, %u slots\n", i, R[i].r.fd, cq, ring_slots);
   return 0;
@@ -404,7 +444,30 @@ static void on_accept(unsigned ri, struct io_uring_cqe *cqe) {
   c->send_arena = NULL;
   rs->open++;
   S.accepts++;
-  arm_multishot(ri, slot, c);
+  arm_idle(ri, slot, c);
+}
+
+/* A poll completion is a readiness hint, not request data.  The queued
+ * MSG_DONTWAIT read is issued in read_rounds.  Delay rearm until the batch
+ * ends if the kernel ended the multishot poll. */
+static void on_poll(unsigned ri, struct io_uring_cqe *cqe) {
+  unsigned slot = UD_SLOT(cqe->user_data);
+  struct conn *c = &R[ri].conns[slot];
+  if (!ref_live(cqe->user_data, c)) return;
+  S.poll_events++;
+  if (!(cqe->flags & IORING_CQE_F_MORE)) {
+    c->flags &= (uint16_t)~CF_POLL;
+    S.poll_ends++;
+    if (!(c->flags & CF_POLL_REARM)) {
+      c->flags |= CF_POLL_REARM;
+      list_push(&poll_rearms, &n_poll_rearms, &poll_rearms_cap, REF(ri, c->gen, slot));
+    }
+  }
+  if (cqe->res < 0) {
+    if (cqe->res != -ECANCELED) finish_conn(ri, slot, c);
+    return;
+  }
+  queue_read(ri, slot, c); /* POLLIN or POLLRDHUP: recv determines data or EOF */
 }
 
 static void on_recv(unsigned ri, struct io_uring_cqe *cqe, int multishot) {
@@ -429,12 +492,12 @@ static void on_recv(unsigned ri, struct io_uring_cqe *cqe, int multishot) {
     } else if ((unsigned)cqe->res == rs->r.buf_size) {
       queue_read(ri, slot, c); /* the buffer filled: there may be more */
     } else {
-      arm_multishot(ri, slot, c); /* drained */
+      arm_idle(ri, slot, c); /* drained; poll mode already has a persistent poll */
     }
     return;
   }
   if (cqe->res == -ENOBUFS) { S.enobufs++; queue_read(ri, slot, c); return; }
-  if (cqe->res == -EAGAIN) { arm_multishot(ri, slot, c); return; }
+  if (cqe->res == -EAGAIN) { arm_idle(ri, slot, c); return; }
   finish_conn(ri, slot, c); /* EOF or an error */
 }
 
@@ -461,6 +524,22 @@ static void on_close(unsigned ri, struct io_uring_cqe *cqe) {
   conn_freed(ri, c);
 }
 
+static void on_eventfd(struct io_uring_cqe *cqe) {
+  unsigned notified_ring = UD_RING(cqe->user_data);
+  if (notified_ring >= NR || R[notified_ring].efd < 0) return;
+  S.eventfd_events++;
+  /* Drain the eventfd's readiness counter.  It is nonblocking and may have
+   * already been drained by another eventfd CQE in this batch.  Without this,
+   * an eventfd can remain readable and generate unnecessary poll wakeups. */
+  uint64_t count;
+  (void)read(R[notified_ring].efd, &count, sizeof count);
+  /* The multishot eventfd poll normally stays armed.  If it terminates,
+   * rearm it on the primary ring for reliable cross-ring wakeups. */
+  if (!(cqe->flags & IORING_CQE_F_MORE) && eventfd_wake)
+    sqe_poll_eventfd(ring_sqe(&R[0].r), R[notified_ring].efd,
+                     UD(UD_EVENTFD, notified_ring, 0, 0));
+}
+
 static unsigned reap(unsigned ri) {
   struct ring *r = &R[ri].r;
   if (LOAD_RLX(r->sq_flags) & IORING_SQ_CQ_OVERFLOW) S.cq_overflow++;
@@ -469,6 +548,8 @@ static unsigned reap(unsigned ri) {
     struct io_uring_cqe *cqe = &r->cqes[head & r->cq_mask];
     switch (UD_OP(cqe->user_data)) {
     case UD_RECV: on_recv(ri, cqe, 1); break;
+    case UD_POLL: on_poll(ri, cqe); break;
+    case UD_EVENTFD: on_eventfd(cqe); break;
     case UD_READ: on_recv(ri, cqe, 0); break;
     case UD_SEND: on_send(ri, cqe); break;
     case UD_ACCEPT: on_accept(ri, cqe); break;
@@ -485,6 +566,20 @@ static unsigned reap(unsigned ri) {
   STORE_REL(r->cq_head, head);
   ring_buf_publish(r); /* returned buffers are usable by the kernel at once (the read rounds need them) */
   return n;
+}
+
+/* Avoid rearming a terminal poll from inside the CQE drain.  A stale entry
+ * is ignored by the socket generation guard when its slot is reused. */
+static void rearm_ended_polls(void) {
+  for (unsigned i = 0; i < n_poll_rearms; i++) {
+    uint64_t ref = poll_rearms[i];
+    struct conn *c = ref_conn(ref);
+    if (!ref_live(ref, c) || !(c->flags & CF_POLL_REARM)) continue;
+    c->flags &= (uint16_t)~CF_POLL_REARM;
+    arm_idle(UD_RING(ref), UD_SLOT(ref), c);
+    S.poll_rearmed++;
+  }
+  n_poll_rearms = 0;
 }
 
 static unsigned reap_all(void) {
@@ -544,7 +639,16 @@ static unsigned read_rounds(void) {
 static unsigned reap_every = 512;
 static void run_ready(void) {
   unsigned n = nready, i = 0, since = 0;
+  /* Only time-slice an established backlog. Normal batches follow the original fast path. */
+  uint64_t deadline = backlog_slice_us && nready > 1024 ? now_ns() + (uint64_t)backlog_slice_us * 1000ULL : 0;
   for (; i < n && answers_left; i++) {
+    if (deadline && (i & 127u) == 0 && now_ns() >= deadline) {
+      /* Save all unprocessed ready references for the next committed batch.
+       * New CQEs are still drained into connection-local pending storage. */
+      answers_left = 0;
+      sliced_ready_passes++;
+      break;
+    }
     if (reap_every && ++since >= reap_every) {
       since = 0;
       unsigned keep = answers_left;
@@ -637,7 +741,8 @@ static void stats(uint64_t dt_ns) {
           "deferred=%llu rq_max=%llu ready_max=%llu cq_overflow=%llu cancels=%llu wal=%d ckpt_passes=%llu cycles=%llu force=%llu "
           "fallback=%llu errors=%llu cache_miss=%d maxrss=%ldMB cpu=%.2fs max_turn=%.1fms max_commit=%.1fms wal_pwrites=%llu "
           "bulk_max=%.0fms hold_max=%.1fms hold_total=%.1fms hold_timeouts=%llu tail_frames_max=%llu tail_short=%llu passes_max=%llu "
-          "wait_max=%.1fms majflt=%ld tail_restarts=%llu begin_busy=%llu heap=%zuMB heap_free=%zuMB arenas=%u trims=%llu\n",
+          "wait_max=%.1fms majflt=%ld tail_restarts=%llu begin_busy=%llu heap=%zuMB heap_free=%zuMB arenas=%u trims=%llu slices=%llu "
+          "poll_events=%llu poll_ends=%llu poll_rearms=%llu eventfd_events=%llu\n",
           (unsigned long long)T_reqs, (double)S.reqs / dt, (double)S.batches / dt, S.batches ? (double)S.cqes / (double)S.batches : 0.0,
           (unsigned long long)S.max_batch, (unsigned long long)S.accepts, (unsigned long long)S.closes, (unsigned long long)S.enobufs,
           (unsigned long long)S.reads, (unsigned long long)S.deferred, (unsigned long long)S.rq_max, (unsigned long long)S.ready_max,
@@ -647,7 +752,10 @@ static void stats(uint64_t dt_ns) {
           (unsigned long long)wal_pwrites, (double)A.db.bulk_max_ns / 1e6, (double)A.db.hold_max_ns / 1e6,
           (double)A.db.hold_total_ns / 1e6, (unsigned long long)A.db.n_hold_timeout, (unsigned long long)A.db.tail_frames_max,
           (unsigned long long)A.db.n_tail_short, (unsigned long long)A.db.n_passes_max, (double)S.max_gap_ns / 1e6, ru.ru_majflt - majflt_prev,
-          (unsigned long long)A.db.n_tail_restart, (unsigned long long)A.db.n_begin_busy, mi.arena >> 20, mi.fordblks >> 20, arenas_mapped, n_trims);
+          (unsigned long long)A.db.n_tail_restart, (unsigned long long)A.db.n_begin_busy, mi.arena >> 20, mi.fordblks >> 20, arenas_mapped, n_trims,
+          (unsigned long long)sliced_ready_passes, (unsigned long long)S.poll_events,
+          (unsigned long long)S.poll_ends, (unsigned long long)S.poll_rearmed,
+          (unsigned long long)S.eventfd_events);
   majflt_prev = ru.ru_majflt;
   memset(&S, 0, sizeof S);
   A.db.bulk_max_ns = A.db.hold_max_ns = A.db.hold_total_ns = A.db.tail_frames_max = 0;
@@ -865,8 +973,16 @@ int main(int argc, char **argv) {
   if (accept_stop < 16) accept_stop = 16;
   if (accept_next <= accept_stop) accept_next = accept_stop + 16;
   recv_bufs = (unsigned)env_long("RECV_BUFS", 8192);
-  answers_per_pass = (unsigned)env_long("ANSWERS_PER_PASS", 16384);
+  answers_per_pass = (unsigned)env_long("ANSWERS_PER_PASS", 2048);
   reap_every = (unsigned)env_long("REAP_EVERY", 512);
+  poll_idle = env_long("IDLE_POLL", 0) != 0;
+  eventfd_wake = env_long("EVENTFD_WAKE", 0) != 0;
+  recv_buf_size = (unsigned)env_long("RECV_SIZE", RECV_BUF_SIZE_DEFAULT);
+  if (recv_buf_size < 256 || recv_buf_size > 2048 || (recv_buf_size & (recv_buf_size - 1))) {
+    fprintf(stderr, "RECV_SIZE must be a power of 2 between 256 and 2048\n");
+    return 1;
+  }
+  backlog_slice_us = (unsigned)env_long("BACKLOG_SLICE_US", 0); /* 0: a ready backlog is answered without a time limit */
   /* Ring 0 waits for 64 completions or 2 ms: fewer, fuller passes (each pass enters every ring).
    * Measured at 300k connections: ~4 % less loop CPU than 256 / 1 ms, p99 unchanged. */
   wait_min = (unsigned)env_long("WAIT_MIN", 64);
@@ -898,9 +1014,11 @@ int main(int argc, char **argv) {
   /* The rings a full load needs are made now, while the box is idle: a ring is ~1 MB of
    * physically contiguous kernel memory, and asking for that mid-ramp, with a gigabyte of socket
    * slab fragmenting the memory, can stall the loop in compaction. */
-  long pre = env_long("PRE_CONNS", 330000);
+  long pre = env_long("PRE_CONNS", 330000); /* pre-create six rings for a 310k+ run; use 430000 for 400k */
   while (NR < NR_MAX && (long)NR * (long)nslots < pre && ring_create(NR) == 0) NR++;
   prewarm();
+  fprintf(stderr, "experiment: idle_poll=%d eventfd_wake=%d recv_size=%u backlog_slice_us=%u pre_conns=%ld\n",
+          poll_idle, eventfd_wake, recv_buf_size, backlog_slice_us, pre);
   fprintf(stderr, "listening on %s:%s: up to %u rings x %u direct descriptors; cache %d KiB; code locked %zu KiB\n", host, port, NR_MAX,
           nslots, cache_kib, lock_code() >> 10);
   accept_policy();
@@ -909,7 +1027,8 @@ int main(int argc, char **argv) {
   unsigned last_cqes = 0;
   for (;;) {
     /* 1. the other rings: submit what the last batch queued and collect their completions */
-    for (unsigned i = 1; i < NR; i++) ring_enter(&R[i].r, 0, 0);
+    for (unsigned i = 1; i < NR; i++)
+      if (!eventfd_wake || ring_pending_submit(&R[i].r)) ring_enter(&R[i].r, 0, 0);
     /* 2. ring 0 waits (unless work is already queued): bigger batches share one commit */
     int busy = nready || (nrq > rq_head) || (nheld && !A.db.writes_held);
     long rc;
@@ -938,6 +1057,7 @@ int main(int argc, char **argv) {
     A.db.wrote = 0;
     db_tick(&A.db); /* no transaction is open: the only point where a hold starts or ends */
     for (unsigned i = 0; i < NR; i++) ring_buf_publish(&R[i].r);
+    rearm_ended_polls();
     accept_policy();
     last_cqes = ncq;
     S.batches++;

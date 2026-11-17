@@ -284,3 +284,95 @@ Other local runs: 5,000 users over three rings of 1,936 slots (ring switching), 
 process memory; receive buffers starved to 16 per ring, 0 errors (the read queue absorbs it).
 Loopback charges the client side's receive work to the server too, so these are only comparable
 with each other.
+
+## Switches from #479 / #480 (all off but the SHA-256 schedule)
+
+#479 and #480 tried five changes on top of `e487a70` (#441, 285,000 on the box). Their rig runs
+held 230,000 and 270,000. Measured here one at a time against `e487a70` (local, server on one
+core, 280,000 users, 60 s ramp + 90 s hold, two interleaved rounds, the same request rate in
+every run):
+
+| Build | App CPU | Hold p50 / p99 |
+|---|---:|---:|
+| `e487a70` | 33 %, 34 % | 4.5 / 7.0-7.5 ms |
+| eventfd wake-ups + rolling SHA-256 | 40 %, 39 % | 2.2 / 4.3-4.5 ms |
+| rolling SHA-256 only | 34 %, 33 % | 4.5 / 7.0-7.9 ms |
+
+- **Rolling SHA-256 schedule** (on; `SHA256_ROLLING16=0` at build time restores the 64-word
+  one): 16 words in a ring instead of 64, for the JWT HMAC of every write. CPU-neutral within the
+  noise above (writes are ~8 % of requests), kept for the smaller stack. `build.sh` checks NIST
+  and RFC 4231 vectors for both schedules before compiling.
+- **`EVENTFD_WAKE=1`** (off): the other rings drop `DEFER_TASKRUN` and signal an eventfd that
+  ring 0 polls, so a completion anywhere ends ring 0's wait. Latency halves, but ring 0 no
+  longer waits out its 64-completion / 2 ms window: more, smaller batches, +18 % CPU per
+  request. On one vCPU the CPU is what runs out at 290k+, so it stays off.
+- **`IDLE_POLL=1`** (off): idle connections wait on a multishot poll and a poll event queues a
+  single-shot read (as in c-iouring-pavlyhalim): less kernel memory per idle socket, one more
+  submission per request. #479 had it on and its latency rose at 61 % CPU.
+- **`BACKLOG_SLICE_US`** (0, off): a soft time limit on answering a large ready backlog.
+- **`RECV_SIZE`** (1024): provided receive buffer size; 512 saves ~28 MB over seven rings.
+- `LTO=1 bash build.sh` adds link-time optimization (off; the server and SQLite are already one
+  translation unit).
+
+
+## Follow-up to #482: 2,048-answer cap, 320K-user comparison
+
+This follow-up changes **only** the default event-loop response budget:
+`ANSWERS_PER_PASS=2048` instead of `16384`. The variable's environment
+override is retained. The read budget (`READS_PER_PASS=16384`), per-ring
+receive buffer count and size, ring waits (`WAIT_MIN=64`, `WAIT_US=2000`),
+checkpoint schedule, PGO build, rolling SHA-256, multishot receives and
+acceptance policy are unchanged from #482. The purpose is to measure
+whether shorter response-processing passes protect tail latency at high
+connection counts, not to claim an already achieved 320K result.
+
+### Correctness
+
+Run the challenge's unmodified 42-check suite on the new commit:
+
+```bash
+bash test/run.sh submissions/c-iouring-jowinjestine
+```
+
+Do not evaluate capacity unless all **42/42** checks pass, including
+write/commit visibility and JWT verification. The GitHub pull-request CI
+runs that same suite.
+
+### Reproducible load A/B (separate k6 host)
+
+Build once with the existing PGO setup. Use the same server/VM, kernel,
+seed-database copy, JWT secret, process startup settings, k6 host and k6
+workload for **both** runs. Start each run from a fresh equivalent seed copy
+and restart the server, so the first variant cannot inherit the second
+variant's WAL/database state. Avoid running k6 on the one-vCPU server.
+
+- Control (#482): `ANSWERS_PER_PASS=16384`
+- Experiment (this PR, default): `ANSWERS_PER_PASS=2048`
+
+The canonical test is `bench/load.js` from the repository root. Its
+ramp-up is 60 seconds; `DURATION` specifies the **hold**, not the ramp.
+
+```bash
+# Optional scouting probe: a 2-minute 320K hold, not an official score
+k6 run -e BASE_URL=http://SERVER_IP:80 -e VUS=320000 -e RAMP_UP=60s -e DURATION=2m bench/load.js
+
+# Required A/B comparison: a full 5-minute 320K-user hold, per variant
+k6 run -e BASE_URL=http://SERVER_IP:80 -e VUS=320000 -e RAMP_UP=60s -e DURATION=5m bench/load.js
+```
+
+Record actual held VUs, request rate, p95, p99, failed request rate,
+CPU microseconds/request, cgroup RAM peak, `max_turn`, `max_commit`,
+`ready_max`, `rq_max`, `enobufs`, and checkpoint holds. Collect
+per-10-second p99/queue trends where possible: a short probe can pass
+while the five-minute hold degrades.
+
+| Configuration | 320K 2-minute probe | 320K 5-minute hold | p95/p99 | errors | µs/req | RAM |
+|---|---|---|---|---|---|---|
+| #482, 16,384 answers | Not run | Not run | — | — | — | — |
+| This PR, 2,048 answers | Not run | Not run | — | — | — | — |
+
+A scored pass requires p95 **below 500 ms**, p99 **below 1,000 ms**
+and failed requests **below 1%** on the entire five-minute hold.
+An official result also requires the challenge operator's evaluation
+on the specified 1-vCPU/2-GB environment. A 320K probe failure should
+not be mistaken for a five-minute score.
